@@ -155,3 +155,38 @@ def test_canonical_failure_drains_inflight_and_dispatches_nothing_new(tmp_path, 
     statuses = Counter(record["status"] for record in index.values())
     assert statuses["completed"] == 1  # The in-flight scene 2 was resolved and indexed.
     assert statuses["planned"] == 3  # Scenes 3-5 were never dispatched.
+
+
+def test_bookkeeping_error_still_resolves_inflight_canonicals(tmp_path, monkeypatch):
+    import time
+
+    from acoustic_orchestrator.pipeline import render_pipeline
+    from acoustic_orchestrator.pipeline.render_attempt import read_json_object
+
+    path, layout = configure(tmp_path, scenes=3, workers=3, optional=True)
+
+    def archive_fails(*args, **kwargs):
+        raise PermissionError(13, "file in use")
+
+    def run(command, **kwargs):
+        manifest = process_manifest(command)
+        if manifest["scene_id"] == "scene_static_0003":
+            time.sleep(0.1)  # Rejected first, while scenes 1 and 2 are still rendering.
+            Path(manifest["render"]["output_wav_path"]).parent.mkdir(parents=True, exist_ok=True)
+            Path(manifest["render"]["output_wav_path"]).write_bytes(b"simulated render")
+            _write_valid_raven_metadata(manifest, [0.5] * 9)
+            return SimpleNamespace(returncode=0)
+        time.sleep(1.0)
+        return successful_process(command, **kwargs)
+
+    monkeypatch.setattr(render_pipeline, "_archive_prepared_source_paths", archive_fails)
+    monkeypatch.setattr(RUNNER, run)
+    with pytest.raises(RenderStaticRunError) as raised:
+        render_static_scenes(path)
+    assert isinstance(raised.value.__cause__, PermissionError)
+    states = [read_json_object(p)["state"]
+              for p in (layout["render_attempts_dir"].parent / "process_chains").glob("*/chain.json")]
+    assert "running" not in states
+    index = load_variant_index(layout["render_index_path"])
+    assert index["scene_static_0001__binaural_hrtf"]["status"] == "completed"
+    assert index["scene_static_0002__binaural_hrtf"]["status"] == "completed"

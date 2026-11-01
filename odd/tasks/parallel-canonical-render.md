@@ -16,8 +16,8 @@ Branch: `feat/workers`. Delivery: ask-on-risk. Tests: `apps/orchestrator/.venv/S
 
 ## Tasks
 
-- [ ] T1 (S1-S7) inline — extract per-scene round/after-canonical steps, add bounded canonical dispatcher, tests RED→GREEN, docs. Commit: pending.
-- [ ] T2 (S1-S7) delegated verifier — Risk item 4 (concurrency). Pending.
+- [x] T1 (S1-S7) inline — extract per-scene round/after-canonical steps, add bounded canonical dispatcher, tests RED→GREEN, docs. Commit: 1c826d2.
+- [x] T2 (S1-S7) delegated verifier — Risk item 4 (concurrency). S1-S4, S6, S7 PASS; S5 blocker fixed. Commit: see L5.
 - [ ] T3 (S8) user-run — real MATLAB benchmark needs the user's MATLAB/RAVEN licenses. Pending.
 
 ## Log
@@ -25,3 +25,5 @@ Branch: `feat/workers`. Delivery: ask-on-risk. Tests: `apps/orchestrator/.venv/S
 - L1 (2026-11-01, user): "Se necesita mejorar o refactorizasr la implementacion de workers en la planificacion y renderizado de las escenas acústicas" (planning part delivered in commit da44858).
 - L2 (2026-11-01, user): "si prepara el plan para la paralelización del rendeer" → plan presented in chat; user: "si, implementalo".
 - L3: Route: T1 inline (one behavior, no Writer trigger reason). Engram mirror pending: Engram tools unavailable in this session.
+- L4: T1 evidence — RED on base: `test_canonical_renders_of_different_scenes_overlap` (BrokenBarrierError) and `test_canonical_failure_drains_inflight_and_dispatches_nothing_new` failed; GREEN after change: 4/4; full suite 982 passed, 1 env failure (matplotlib). T2 verifier launched on 1c826d2.
+- L5: T2 verifier on 1c826d2 — blocker B1 (S5): an exception in main-thread bookkeeping (`advance`/`complete`, e.g. Windows PermissionError while archiving) left in-flight canonical chains `running`, blocking the next run. Fix: record it as the first error and keep draining. Regression `test_bookkeeping_error_still_resolves_inflight_canonicals` RED→GREEN; full suite 983 passed, 1 env failure. Advisories kept: a scene halted during shutdown keeps its rejected canonical (no archive/resample, as S5 requires); progress may count a non-dispatched retry as "fallidas".

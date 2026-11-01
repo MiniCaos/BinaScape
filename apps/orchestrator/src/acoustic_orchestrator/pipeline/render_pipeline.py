@@ -602,8 +602,15 @@ def _render_canonical_in_parallel(stage: _CanonicalStage, manifest_paths: list[P
                     scene, prior_error = retries.pop(0)
                     submit(executor, scene, prior_error)
                     continue
-                scene = rounds.pop(0) if rounds else stage.start_scene(*upcoming.pop(0))
-                if stage.advance(scene) == "dispatch":
+                # Bookkeeping errors stop dispatch like a render error, so the
+                # attempts already in flight are still drained and resolved.
+                try:
+                    scene = rounds.pop(0) if rounds else stage.start_scene(*upcoming.pop(0))
+                    ready = stage.advance(scene) == "dispatch"
+                except Exception as exc:
+                    stage.fail(exc)
+                    break
+                if ready:
                     stage.render_jobs += 1
                     submit(executor, scene, None)
             if not futures:
@@ -627,7 +634,11 @@ def _render_canonical_in_parallel(stage: _CanonicalStage, manifest_paths: list[P
                 if retry and stage.can_dispatch:
                     retries.append((scene, result["error"]))
                     continue
-                if stage.complete(scene, result, allow_resample=stage.can_dispatch) == "again":
+                try:
+                    outcome = stage.complete(scene, result, allow_resample=stage.can_dispatch)
+                except Exception as exc:
+                    outcome = stage.fail(exc)
+                if outcome == "again":
                     rounds.append(scene)
     if coordinator.circuit.is_open and stage.first_render_error is None:
         stage.fail(RetryBlockedError(f"Corte de procesos MATLAB: {coordinator.circuit.path}"))
