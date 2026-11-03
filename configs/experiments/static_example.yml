@@ -1,5 +1,5 @@
 experiment:
-  experiment_id: e2e_raven_rt30_binaural_20261023
+  experiment_id: e2e_1_worker
   description: >
     Validacion E2E pequena de RAVEN estatico y Clarity: dos escenas,
     dos HRTF binaurales por escena, dos fuentes y perfil symmetric_moderate_loss.
@@ -197,7 +197,7 @@ scene_validation:
 
 outputs:
   artifact_root: ../../outputs/
-  run_name: e2e_raven_rt30_binaural_20261023
+  run_name: e2e_1_worker
 
   naming:
     scene_id_prefix: scene_static
