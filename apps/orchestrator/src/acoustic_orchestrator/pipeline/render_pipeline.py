@@ -2,6 +2,7 @@ import json
 import hashlib
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from uuid import uuid4
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -140,222 +141,25 @@ def _render_static_scenes_locked(
                 metadata_required=metadata_required,
             ),
         )
-    render_jobs = 0
     attempt_records: list[dict[str, Any]] = []
-    accepted_manifest_paths: list[Path] = []
-    render_tasks: list[RenderTask] = []
-    reused_remaining: list[str] = []
-    prepared_source_paths_by_scene: dict[str, dict[str, str]] = {}
-    first_render_error: Exception | None = None
-
-    progress.begin("Render canonico", len(manifest_paths), "escenas")
-    for manifest_path in manifest_paths:
-        # Strict inspection happens in preflight; retain the producer's numeric
-        # spelling when deriving runtime JSON (e.g. a gain of 6.0 stays 6.0).
-        scene_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        progress.start(scene_manifest["scene_id"])
-        scene_index = int(scene_manifest["reverberation_sampling"]["scene_index"])
-        raven_rejections: list[dict] = list(
-            scene_manifest["reverberation_sampling"].get("raven_t30_rejections", [])
-        )
-
-        while True:
-            planned_variants = _build_planned_variants_from_manifest(
-                config, scene_manifest, runtime_manifest_dir
-            )
-            for planned_variant in planned_variants:
-                if planned_variant["variant_paths"]["variant_id"] in existing_records:
-                    continue
-                upsert_variant(
-                    index_path,
-                    variant_records,
-                    build_planned_variant_record(
-                        planned_variant["variant_paths"],
-                        metadata_required=metadata_required,
-                    ),
-                )
-
-            prepared_source_paths = prepared_source_paths_by_scene.get(scene_manifest["scene_id"])
-            if prepared_source_paths is None:
-                prepared_source_paths = prepare_scene_source_assets(
-                    scene_manifest,
-                    layout["prepared_audio_dir"] / scene_manifest["scene_id"],
-                    create=False,
-                )
-                prepared_source_paths_by_scene[scene_manifest["scene_id"]] = prepared_source_paths
-
-            # Check every variant before overwriting runtime evidence, including
-            # sources, timing and IR selection, not only array geometry.
-            resume_allowed = {}
-            for variant_number, variant in enumerate(planned_variants):
-                _, expected_manifest = build_single_receiver_render_manifest(
-                    variant["scene_manifest"], variant["receiver_variant"], runtime_manifest_dir,
-                    config.outputs, variant["receiver_output"], prepared_source_paths,
-                )
-                resume_allowed[variant["variant_paths"]["variant_id"]] = (
-                    all(Path(path).is_file() for path in prepared_source_paths.values())
-                    and config.execution.resume_if_possible and should_resume_variant(
-                        existing_records, variant["variant_paths"], metadata_required=True if variant_number == 0 else metadata_required,
-                        history=resume_history, expected_manifest=expected_manifest,
-                    )
-                )
-            if not all(resume_allowed.values()):
-                prepare_scene_source_assets(
-                    scene_manifest, layout["prepared_audio_dir"] / scene_manifest["scene_id"],
-                )
-            prepared_tasks = [
-                _prepare_render_task(
-                    config,
-                    planned_variant,
-                    runtime_manifest_dir,
-                    prepared_source_paths,
-                    materialize=not resume_allowed.get(planned_variant["variant_paths"]["variant_id"], False),
-                )
-                for planned_variant in planned_variants
-            ]
-            canonical_task = prepared_tasks[0]
-            canonical_paths = canonical_task["variant_paths"]
-            resumed = config.execution.resume_if_possible and resume_allowed.get(
-                canonical_paths["variant_id"], False
-            ) and should_resume_variant(
-                existing_records,
-                canonical_paths,
-                metadata_required=True,
-            )
-            if resumed:
-                canonical_validation = validate_render(canonical_paths, metadata_required=True, canonical=True, profile="reuse")
-                canonical_record = inspect_variant(
-                    canonical_paths,
-                    metadata_required=True,
-                    attempted=False,
-                    resumed=True,
-                    render_validation=canonical_validation,
-                    resume_history=resume_history,
-                )
-                upsert_variant(index_path, variant_records, canonical_record)
-                if not canonical_validation.artifacts_ok:
-                    first_render_error = RenderValidationError(canonical_validation.as_record()["issues"])
-                    break
-            else:
-                render_jobs += 1
-                result = coordinator.execute(
-                    canonical_task, matlab_executable=matlab_executable, metadata_required=metadata_required,
-                    canonical=True, attempt_records=attempt_records,
-                )
-                if result["error"] is not None:
-                    acceptance = result.get("acceptance")
-                    if acceptance is not None and acceptance.process.attempt.record.get("commit_status") == "committed":
-                        progress.resolve(scene_manifest["scene_id"], "fallidas")
-                    first_render_error = result["error"]
-                    break
-                canonical_record = variant_records[canonical_paths["variant_id"]]
-                canonical_validation = result["acceptance"].validation
-
-            t30_diagnostic = canonical_validation.acoustic_rejection
-            if t30_diagnostic is not None:
-                t30_diagnostic = {**t30_diagnostic, "metadata_path": canonical_paths["render_metadata_path"]}
-            if t30_diagnostic is None:
-                accepted_manifest_paths.append(manifest_path)
-                progress.resolve(scene_manifest["scene_id"], "reutilizadas" if resumed else "aceptadas")
-                for task in prepared_tasks[1:]:
-                    variant_paths = task["variant_paths"]
-                    if config.execution.resume_if_possible and resume_allowed.get(
-                        variant_paths["variant_id"], False
-                    ) and should_resume_variant(
-                        existing_records,
-                        variant_paths,
-                        metadata_required=metadata_required,
-                    ):
-                        upsert_variant(
-                            index_path,
-                            variant_records,
-                            inspect_variant(
-                                variant_paths,
-                                metadata_required=metadata_required,
-                                attempted=False,
-                                resumed=True,
-                                resume_history=resume_history,
-                            ),
-                        )
-                        reused_remaining.append(variant_paths["variant_id"])
-                    else:
-                        render_tasks.append(task)
-                break
-
-            t30_diagnostic.update(
-                {
-                    "scene_index": scene_index,
-                    "scene_id": scene_manifest["scene_id"],
-                    "output_type": planned_variants[0]["variant_paths"]["output_type"],
-                    "render_status": canonical_record["status"],
-                    "sampling_attempt": scene_manifest["reverberation_sampling"]["attempts"],
-                }
-            )
-            if not config.execution.overwrite_existing and any(
-                resume_allowed.get(task["variant_paths"]["variant_id"], False) for task in prepared_tasks[1:]
-            ):
-                first_render_error = RenderValidationError(["acoustic_resampling_would_replace_protected_variants"])
-                break
-            raven_rejections.append(t30_diagnostic)
-            progress.count("remuestreos_T30")
-            # Scene-wide resampling invalidates every variant of this scene,
-            # but must retain their evidence rather than silently deleting it.
-            for task in prepared_tasks:
-                coordinator._archive_replaced_outputs(task, include_runtime=True)
-            _archive_prepared_source_paths(prepared_source_paths, layout["render_attempts_dir"].parent)
-            upsert_variant(
-                index_path,
-                variant_records,
-                inspect_variant(
-                    canonical_paths,
-                    metadata_required=metadata_required,
-                    attempted=True,
-                ),
-            )
-
-            attempts_used = int(scene_manifest["reverberation_sampling"]["attempts"])
-            try:
-                sampled_scene = sample_static_scene(
-                    config,
-                    None,
-                    scene_index,
-                    start_scene_attempt=attempts_used + 1,
-                    prior_rejections={
-                        **scene_manifest["reverberation_sampling"].get("rejections_by_reason", {}),
-                        "raven_t30_invalid": len(raven_rejections),
-                    },
-                )
-            except SceneSamplingFailure as exc:
-                failure = _append_raven_sampling_failure(
-                    sampling_summary,
-                    scene_manifest,
-                    exc.diagnostics,
-                    raven_rejections,
-                )
-                _discard_failed_scene_variants(
-                    planned_variants,
-                    metadata_required=metadata_required,
-                    index_path=index_path,
-                    variant_records=variant_records,
-                    coordinator=coordinator,
-                )
-                manifest_path.unlink(missing_ok=True)
-                record_static_scene_failure(config, scene_manifest["scene_id"], failure, lock=lock)
-                progress.resolve(scene_manifest["scene_id"], "fallidas")
-                break
-
-            sampled_scene["background_noise"] = scene_manifest.get("background_noise")
-            scene_manifest = build_static_manifest(config, sampled_scene, scene_index, manifest_path)
-            scene_manifest["reverberation_sampling"]["raven_t30_rejections"] = list(raven_rejections)
-            scene_manifest["reverberation_sampling"]["raven_retry_count"] = len(raven_rejections)
-            # The candidate must be durable before any of its MATLAB attempts.
-            # A crash between scene and plan publication remains fail-closed.
-            write_manifest(scene_manifest, manifest_path, overwrite=True)
-            record_static_manifest_revision(config, scene_manifest, manifest_path, lock=lock)
-            prepared_source_paths_by_scene.pop(scene_manifest["scene_id"], None)
-
-        if first_render_error is not None:
-            break
+    stage = _CanonicalStage(
+        config=config, layout=layout, coordinator=coordinator, existing_records=existing_records,
+        variant_records=variant_records, resume_history=resume_history, sampling_summary=sampling_summary,
+        matlab_executable=matlab_executable, attempt_records=attempt_records, lock=lock, progress=progress,
+    )
+    canonical_workers = min(config.execution.num_workers, len(manifest_paths))
+    progress.begin("Render canonico", len(manifest_paths), "escenas", parallel=canonical_workers > 1)
+    if canonical_workers > 1:
+        _render_canonical_in_parallel(stage, manifest_paths, canonical_workers)
+    else:
+        _render_canonical_sequentially(stage, manifest_paths)
+    first_render_error = stage.first_render_error
+    render_jobs = stage.render_jobs
+    # Scene order, not completion order, decides every downstream list.
+    finished = sorted(stage.scenes, key=lambda scene: scene.position)
+    accepted_manifest_paths = [scene.manifest_path for scene in finished if scene.accepted]
+    render_tasks: list[RenderTask] = [task for scene in finished for task in scene.remaining_tasks]
+    reused_remaining = [variant_id for scene in finished for variant_id in scene.reused_remaining]
 
     progress.finish("interrumpido" if first_render_error is not None else "")
     manifest_paths = accepted_manifest_paths
@@ -448,6 +252,396 @@ class RenderResult(TypedDict):
     task: RenderTask
     error: Exception | None
     acceptance: NotRequired[RenderAcceptance]
+
+
+@dataclass
+class _CanonicalScene:
+    """Mutable state of one scene while its canonical variant is decided."""
+
+    position: int
+    manifest_path: Path
+    scene_manifest: dict
+    scene_index: int
+    raven_rejections: list[dict]
+    planned_variants: list[dict] = field(default_factory=list)
+    prepared_source_paths: dict[str, str] = field(default_factory=dict)
+    resume_allowed: dict[str, bool] = field(default_factory=dict)
+    prepared_tasks: list[RenderTask] = field(default_factory=list)
+    accepted: bool = False
+    remaining_tasks: list[RenderTask] = field(default_factory=list)
+    reused_remaining: list[str] = field(default_factory=list)
+
+    @property
+    def scene_id(self) -> str:
+        return self.scene_manifest["scene_id"]
+
+    @property
+    def canonical_task(self) -> RenderTask:
+        return self.prepared_tasks[0]
+
+
+class _CanonicalStage:
+    """Canonical-first rendering of each scene, including RAVEN T30 resampling.
+
+    Every method runs on the dispatching thread: it alone writes the variant
+    index, retry chains, archives, scene manifests and static plan revisions.
+    Worker threads only run ``_run_single_render_task``.
+    """
+
+    def __init__(self, *, config: AppConfig, layout: dict, coordinator: "_RenderCoordinator",
+                 existing_records: dict, variant_records: dict, resume_history: Any,
+                 sampling_summary: SamplingSummary, matlab_executable: str,
+                 attempt_records: list[dict[str, Any]], lock: StaticWriterLock,
+                 progress: ProgressReporter) -> None:
+        self.config = config
+        self.layout = layout
+        self.coordinator = coordinator
+        self.existing_records = existing_records
+        self.variant_records = variant_records
+        self.resume_history = resume_history
+        self.sampling_summary = sampling_summary
+        self.matlab_executable = matlab_executable
+        self.attempt_records = attempt_records
+        self.lock = lock
+        self.progress = progress
+        self.index_path = layout["render_index_path"]
+        self.runtime_manifest_dir = layout["runtime_manifest_dir"]
+        self.metadata_required = config.execution.save_render_metadata
+        self.prepared_source_paths_by_scene: dict[str, dict[str, str]] = {}
+        self.scenes: list[_CanonicalScene] = []
+        self.render_jobs = 0
+        self.first_render_error: Exception | None = None
+
+    @property
+    def can_dispatch(self) -> bool:
+        return self.first_render_error is None and not self.coordinator.circuit.is_open
+
+    def fail(self, error: Exception) -> str:
+        if self.first_render_error is None:
+            self.first_render_error = error
+        return "error"
+
+    def start_scene(self, position: int, manifest_path: Path) -> _CanonicalScene:
+        # Strict inspection happens in preflight; retain the producer's numeric
+        # spelling when deriving runtime JSON (e.g. a gain of 6.0 stays 6.0).
+        scene_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.progress.start(scene_manifest["scene_id"])
+        scene = _CanonicalScene(
+            position=position,
+            manifest_path=manifest_path,
+            scene_manifest=scene_manifest,
+            scene_index=int(scene_manifest["reverberation_sampling"]["scene_index"]),
+            raven_rejections=list(scene_manifest["reverberation_sampling"].get("raven_t30_rejections", [])),
+        )
+        self.scenes.append(scene)
+        return scene
+
+    def advance(self, scene: _CanonicalScene) -> str:
+        """Prepare rounds until the canonical needs MATLAB ("dispatch") or the scene ends."""
+        while True:
+            outcome = self._begin_round(scene)
+            if outcome != "resumed":
+                return outcome
+            outcome = self._finish_round(scene, *self._resumed_canonical(scene), resumed=True)
+            if outcome != "again":
+                return outcome
+
+    def complete(self, scene: _CanonicalScene, result: RenderResult, *, allow_resample: bool = True) -> str:
+        """Apply a resolved canonical MATLAB result: "again", "done", "halted" or "error"."""
+        if result["error"] is not None:
+            acceptance = result.get("acceptance")
+            if acceptance is not None and acceptance.process.attempt.record.get("commit_status") == "committed":
+                self.progress.resolve(scene.scene_id, "fallidas")
+            return self.fail(result["error"])
+        canonical_record = self.variant_records[scene.canonical_task["variant_paths"]["variant_id"]]
+        return self._finish_round(scene, result["acceptance"].validation, canonical_record,
+                                  resumed=False, allow_resample=allow_resample)
+
+    def _begin_round(self, scene: _CanonicalScene) -> str:
+        config = self.config
+        scene.planned_variants = _build_planned_variants_from_manifest(
+            config, scene.scene_manifest, self.runtime_manifest_dir
+        )
+        for planned_variant in scene.planned_variants:
+            if planned_variant["variant_paths"]["variant_id"] in self.existing_records:
+                continue
+            upsert_variant(
+                self.index_path,
+                self.variant_records,
+                build_planned_variant_record(
+                    planned_variant["variant_paths"],
+                    metadata_required=self.metadata_required,
+                ),
+            )
+
+        prepared_source_paths = self.prepared_source_paths_by_scene.get(scene.scene_id)
+        if prepared_source_paths is None:
+            prepared_source_paths = prepare_scene_source_assets(
+                scene.scene_manifest,
+                self.layout["prepared_audio_dir"] / scene.scene_id,
+                create=False,
+            )
+            self.prepared_source_paths_by_scene[scene.scene_id] = prepared_source_paths
+        scene.prepared_source_paths = prepared_source_paths
+
+        # Check every variant before overwriting runtime evidence, including
+        # sources, timing and IR selection, not only array geometry.
+        scene.resume_allowed = {}
+        for variant_number, variant in enumerate(scene.planned_variants):
+            _, expected_manifest = build_single_receiver_render_manifest(
+                variant["scene_manifest"], variant["receiver_variant"], self.runtime_manifest_dir,
+                config.outputs, variant["receiver_output"], prepared_source_paths,
+            )
+            scene.resume_allowed[variant["variant_paths"]["variant_id"]] = (
+                all(Path(path).is_file() for path in prepared_source_paths.values())
+                and config.execution.resume_if_possible and should_resume_variant(
+                    self.existing_records, variant["variant_paths"],
+                    metadata_required=True if variant_number == 0 else self.metadata_required,
+                    history=self.resume_history, expected_manifest=expected_manifest,
+                )
+            )
+        if not all(scene.resume_allowed.values()):
+            prepare_scene_source_assets(
+                scene.scene_manifest, self.layout["prepared_audio_dir"] / scene.scene_id,
+            )
+        scene.prepared_tasks = [
+            _prepare_render_task(
+                config,
+                planned_variant,
+                self.runtime_manifest_dir,
+                prepared_source_paths,
+                materialize=not scene.resume_allowed.get(planned_variant["variant_paths"]["variant_id"], False),
+            )
+            for planned_variant in scene.planned_variants
+        ]
+        canonical_paths = scene.canonical_task["variant_paths"]
+        resumed = config.execution.resume_if_possible and scene.resume_allowed.get(
+            canonical_paths["variant_id"], False
+        ) and should_resume_variant(
+            self.existing_records,
+            canonical_paths,
+            metadata_required=True,
+        )
+        return "resumed" if resumed else "dispatch"
+
+    def _resumed_canonical(self, scene: _CanonicalScene) -> tuple[Any, dict]:
+        canonical_paths = scene.canonical_task["variant_paths"]
+        canonical_validation = validate_render(canonical_paths, metadata_required=True, canonical=True, profile="reuse")
+        canonical_record = inspect_variant(
+            canonical_paths,
+            metadata_required=True,
+            attempted=False,
+            resumed=True,
+            render_validation=canonical_validation,
+            resume_history=self.resume_history,
+        )
+        upsert_variant(self.index_path, self.variant_records, canonical_record)
+        return canonical_validation, canonical_record
+
+    def _finish_round(self, scene: _CanonicalScene, canonical_validation: Any, canonical_record: dict,
+                      *, resumed: bool, allow_resample: bool = True) -> str:
+        config = self.config
+        canonical_paths = scene.canonical_task["variant_paths"]
+        if resumed and not canonical_validation.artifacts_ok:
+            return self.fail(RenderValidationError(canonical_validation.as_record()["issues"]))
+        t30_diagnostic = canonical_validation.acoustic_rejection
+        if t30_diagnostic is not None:
+            t30_diagnostic = {**t30_diagnostic, "metadata_path": canonical_paths["render_metadata_path"]}
+        if t30_diagnostic is None:
+            scene.accepted = True
+            self.progress.resolve(scene.scene_id, "reutilizadas" if resumed else "aceptadas")
+            for task in scene.prepared_tasks[1:]:
+                variant_paths = task["variant_paths"]
+                if config.execution.resume_if_possible and scene.resume_allowed.get(
+                    variant_paths["variant_id"], False
+                ) and should_resume_variant(
+                    self.existing_records,
+                    variant_paths,
+                    metadata_required=self.metadata_required,
+                ):
+                    upsert_variant(
+                        self.index_path,
+                        self.variant_records,
+                        inspect_variant(
+                            variant_paths,
+                            metadata_required=self.metadata_required,
+                            attempted=False,
+                            resumed=True,
+                            resume_history=self.resume_history,
+                        ),
+                    )
+                    scene.reused_remaining.append(variant_paths["variant_id"])
+                else:
+                    scene.remaining_tasks.append(task)
+            return "done"
+        if not allow_resample:
+            # The batch is stopping: keep the rejected evidence, start nothing new.
+            return "halted"
+
+        t30_diagnostic.update(
+            {
+                "scene_index": scene.scene_index,
+                "scene_id": scene.scene_id,
+                "output_type": scene.planned_variants[0]["variant_paths"]["output_type"],
+                "render_status": canonical_record["status"],
+                "sampling_attempt": scene.scene_manifest["reverberation_sampling"]["attempts"],
+            }
+        )
+        if not config.execution.overwrite_existing and any(
+            scene.resume_allowed.get(task["variant_paths"]["variant_id"], False) for task in scene.prepared_tasks[1:]
+        ):
+            return self.fail(RenderValidationError(["acoustic_resampling_would_replace_protected_variants"]))
+        scene.raven_rejections.append(t30_diagnostic)
+        self.progress.count("remuestreos_T30")
+        # Scene-wide resampling invalidates every variant of this scene,
+        # but must retain their evidence rather than silently deleting it.
+        for task in scene.prepared_tasks:
+            self.coordinator._archive_replaced_outputs(task, include_runtime=True)
+        _archive_prepared_source_paths(scene.prepared_source_paths, self.layout["render_attempts_dir"].parent)
+        upsert_variant(
+            self.index_path,
+            self.variant_records,
+            inspect_variant(
+                canonical_paths,
+                metadata_required=self.metadata_required,
+                attempted=True,
+            ),
+        )
+
+        attempts_used = int(scene.scene_manifest["reverberation_sampling"]["attempts"])
+        try:
+            sampled_scene = sample_static_scene(
+                config,
+                None,
+                scene.scene_index,
+                start_scene_attempt=attempts_used + 1,
+                prior_rejections={
+                    **scene.scene_manifest["reverberation_sampling"].get("rejections_by_reason", {}),
+                    "raven_t30_invalid": len(scene.raven_rejections),
+                },
+            )
+        except SceneSamplingFailure as exc:
+            failure = _append_raven_sampling_failure(
+                self.sampling_summary,
+                scene.scene_manifest,
+                exc.diagnostics,
+                scene.raven_rejections,
+            )
+            _discard_failed_scene_variants(
+                scene.planned_variants,
+                metadata_required=self.metadata_required,
+                index_path=self.index_path,
+                variant_records=self.variant_records,
+                coordinator=self.coordinator,
+            )
+            scene.manifest_path.unlink(missing_ok=True)
+            record_static_scene_failure(config, scene.scene_id, failure, lock=self.lock)
+            self.progress.resolve(scene.scene_id, "fallidas")
+            return "done"
+
+        sampled_scene["background_noise"] = scene.scene_manifest.get("background_noise")
+        scene_manifest = build_static_manifest(config, sampled_scene, scene.scene_index, scene.manifest_path)
+        scene_manifest["reverberation_sampling"]["raven_t30_rejections"] = list(scene.raven_rejections)
+        scene_manifest["reverberation_sampling"]["raven_retry_count"] = len(scene.raven_rejections)
+        # The candidate must be durable before any of its MATLAB attempts.
+        # A crash between scene and plan publication remains fail-closed.
+        write_manifest(scene_manifest, scene.manifest_path, overwrite=True)
+        record_static_manifest_revision(config, scene_manifest, scene.manifest_path, lock=self.lock)
+        self.prepared_source_paths_by_scene.pop(scene_manifest["scene_id"], None)
+        scene.scene_manifest = scene_manifest
+        return "again"
+
+
+def _render_canonical_sequentially(stage: _CanonicalStage, manifest_paths: list[Path]) -> None:
+    for position, manifest_path in enumerate(manifest_paths):
+        scene = stage.start_scene(position, manifest_path)
+        while stage.advance(scene) == "dispatch":
+            stage.render_jobs += 1
+            result = stage.coordinator.execute(
+                scene.canonical_task, matlab_executable=stage.matlab_executable,
+                metadata_required=stage.metadata_required, canonical=True, attempt_records=stage.attempt_records,
+            )
+            if stage.complete(scene, result) != "again":
+                break
+        if stage.first_render_error is not None:
+            break
+
+
+def _render_canonical_in_parallel(stage: _CanonicalStage, manifest_paths: list[Path], workers: int) -> None:
+    """Keep up to ``workers`` scenes with a canonical MATLAB attempt in flight.
+
+    Mirrors ``_RenderCoordinator.execute`` per scene (prepare → run → resolve →
+    retry) and ``_run_render_tasks_in_parallel`` across scenes: after the first
+    error or an open circuit nothing new is dispatched, and in-flight attempts
+    are drained and resolved.
+    """
+    coordinator = stage.coordinator
+    upcoming = list(enumerate(manifest_paths))
+    # Retries and resampled rounds go before new scenes, as in the variant pool.
+    retries: list[tuple[_CanonicalScene, Exception | None]] = []
+    rounds: list[_CanonicalScene] = []
+    futures: dict[Future[RenderResult], _CanonicalScene] = {}
+
+    def submit(executor: ThreadPoolExecutor, scene: _CanonicalScene, prior_error: Exception | None) -> None:
+        try:
+            coordinator.prepare(scene.canonical_task)
+        except Exception as exc:
+            if prior_error is not None:
+                prior_error.add_note(f"No se pudo preparar el siguiente intento: {exc}")
+            stage.fail(prior_error or exc)
+            return
+        futures[executor.submit(
+            _run_single_render_task, scene.canonical_task, matlab_executable=stage.matlab_executable,
+            metadata_required=stage.metadata_required, canonical=True, progress=coordinator.progress,
+        )] = scene
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        while True:
+            while stage.can_dispatch and len(futures) < workers and (retries or rounds or upcoming):
+                if retries:
+                    scene, prior_error = retries.pop(0)
+                    submit(executor, scene, prior_error)
+                    continue
+                # Bookkeeping errors stop dispatch like a render error, so the
+                # attempts already in flight are still drained and resolved.
+                try:
+                    scene = rounds.pop(0) if rounds else stage.start_scene(*upcoming.pop(0))
+                    ready = stage.advance(scene) == "dispatch"
+                except Exception as exc:
+                    stage.fail(exc)
+                    break
+                if ready:
+                    stage.render_jobs += 1
+                    submit(executor, scene, None)
+            if not futures:
+                break
+            completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in completed:
+                scene = futures.pop(future)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {"task": scene.canonical_task, "error": exc}
+                try:
+                    retry = coordinator.resolve(result, metadata_required=stage.metadata_required,
+                                                attempt_records=stage.attempt_records)
+                except Exception as exc:
+                    retry = False
+                    if result["error"] is not None:
+                        result["error"].add_note(f"No se pudo resolver el intento: {exc}")
+                    else:
+                        result["error"] = exc
+                if retry and stage.can_dispatch:
+                    retries.append((scene, result["error"]))
+                    continue
+                try:
+                    outcome = stage.complete(scene, result, allow_resample=stage.can_dispatch)
+                except Exception as exc:
+                    outcome = stage.fail(exc)
+                if outcome == "again":
+                    rounds.append(scene)
+    if coordinator.circuit.is_open and stage.first_render_error is None:
+        stage.fail(RetryBlockedError(f"Corte de procesos MATLAB: {coordinator.circuit.path}"))
 
 
 class _RenderCoordinator:

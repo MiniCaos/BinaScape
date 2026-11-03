@@ -249,7 +249,12 @@ This command:
 
 Parallel MATLAB/RAVEN execution is controlled by `execution.num_workers`.
 `num_workers: 1` keeps execution sequential. Higher values may launch multiple
-MATLAB subprocesses after runtime inputs are prepared. Do not configure more
+MATLAB subprocesses after runtime inputs are prepared: up to `num_workers`
+scenes render their canonical variant at the same time (each scene still
+retries and resamples its RAVEN T30 on its own), and the remaining variants are
+then rendered with the same bound. Accepted scenes and remaining variants keep
+scene order; audit logs (scene revisions, sampling failures) keep completion
+order. Do not configure more
 workers than available MATLAB/RAVEN licenses, and return to `1` if the local
 RAVEN setup shows hidden global state.
 
