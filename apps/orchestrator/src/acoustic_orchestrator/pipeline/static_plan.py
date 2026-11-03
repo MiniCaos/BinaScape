@@ -8,6 +8,7 @@ creates directories. A lock left by an interrupted writer requires intervention.
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ProcessPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ import json
 import math
 import os
 from pathlib import Path
+import pickle
 from typing import Callable, Iterator
 import uuid
 
@@ -321,6 +323,158 @@ def _replay(
     return build_static_manifest(config, sampled, index, path)
 
 
+# Per-scene errors reported as compatibility conflicts instead of aborting.
+_SCENE_CONFLICTS = (ValueError, OSError, KeyError, TypeError, IndexError)
+
+
+@dataclass(frozen=True)
+class _SceneInputs:
+    """Plain, picklable slice of the inspection state one scene depends on."""
+
+    index: int
+    scene_id: str
+    path: Path
+    failed_record: dict | None
+    uncommitted_raven_failure: bool
+    recorded: dict | None
+    recorded_present: bool
+    regeneration_reason: str | None
+    noise: dict
+
+
+@dataclass
+class _SceneResult:
+    """Outcome of evaluating one scene; merged by the caller in scene order."""
+
+    outcome: str
+    observed: bool = False
+    snapshot: tuple[int, int, str] | None = None
+    exists: bool = False
+    manifest: dict | None = None
+    failure: dict | None = None
+    new_failure: bool = False
+    conflict: tuple[str, BaseException] | None = None
+
+
+def _evaluate_scene(
+    config: AppConfig, item: _SceneInputs, failures_path: Path, sample_scene: Callable[..., dict],
+) -> _SceneResult:
+    """Inspect, replay or sample one scene without touching shared state."""
+    path, index = item.path, item.index
+    result = _SceneResult("conflictos")
+    try:
+        result.snapshot = _snapshot(path)
+        result.observed = True
+        exists = path.exists()
+        if item.failed_record is not None:
+            if exists:
+                raise ValueError("Failed scene has an unresolved manifest publication")
+            result.failure, result.outcome = deepcopy(item.failed_record), "fallidas"
+            return result
+        if not exists and item.uncommitted_raven_failure:
+            raise ValueError("Uncommitted acoustic sampling failure; cannot renew its budget")
+        if exists:
+            if item.regeneration_reason or not config.execution.resume_if_possible:
+                if not config.execution.overwrite_existing:
+                    raise ValueError("Scene exists with resume=false and overwrite=false")
+                # Explicit regeneration is allowed, but malformed inputs are
+                # still never silently migrated during a protected resume.
+                exists = False
+            else:
+                manifest = _loads(path.read_text(encoding="utf-8"))
+                validate_static_manifest(manifest, config, index)
+                if item.recorded is not None:
+                    if item.recorded.get("functional_hash") != _hash(functional_manifest(manifest)):
+                        raise ValueError("Persisted realization differs from static plan")
+                    if item.recorded.get("sampling") != manifest["sampling"] or item.recorded.get("scene_index") != index:
+                        raise ValueError("Invalid static plan scene identity")
+                else:
+                    replayed = _replay(config, manifest, index, path, item.noise, sample_scene)
+                    if _json(functional_manifest(replayed)) != _json(functional_manifest(manifest)):
+                        if not config.execution.overwrite_existing:
+                            raise ValueError("Legacy realization cannot be replayed under current configuration")
+                        exists = False
+        if not exists:
+            try:
+                saved = item.recorded if config.execution.resume_if_possible and not item.regeneration_reason else None
+                if saved:
+                    manifest = _replay(config, {"sampling": saved["sampling"]}, index, path, item.noise, sample_scene)
+                    if saved.get("functional_hash") != _hash(functional_manifest(manifest)):
+                        raise ValueError("Missing scene cannot be replayed from recorded realization")
+                    manifest["reverberation_sampling"].update(deepcopy(saved.get("reverberation_history", {})))
+                else:
+                    sampled = sample_scene(config, None, index)
+                    sampled["background_noise"] = item.noise
+                    manifest = build_static_manifest(config, sampled, index, path)
+            except sampler.SceneSamplingFailure as exc:
+                if path.exists():
+                    raise ValueError("Cannot replace existing scene: authorized regeneration failed sampling") from exc
+                result.failure = {**exc.diagnostics, "scene_id": item.scene_id,
+                                  "failure_record_path": failures_path.as_posix()}
+                result.new_failure, result.outcome = True, "fallidas"
+                return result
+            validate_static_manifest(manifest, config, index)
+        result.exists, result.manifest = exists, manifest
+        result.outcome = "conservadas" if exists else "nuevas"
+    except _SCENE_CONFLICTS as exc:
+        result.conflict = (f"{path}: {exc}", exc.__cause__ or exc)
+        result.outcome = "conflictos"
+    return result
+
+
+def _evaluate_scene_task(
+    config: AppConfig, item: _SceneInputs, failures_path: Path, sample_scene: Callable[..., dict],
+) -> _SceneResult:
+    """Process-pool entry point: keep the result transferable to the parent."""
+    result = _evaluate_scene(config, item, failures_path, sample_scene)
+    if result.conflict is not None:
+        message, cause = result.conflict
+        try:
+            pickle.loads(pickle.dumps(cause))
+        except Exception:
+            result.conflict = (message, ValueError(str(cause)))
+    return result
+
+
+def _planning_workers(config: AppConfig, sample_scene: Callable[..., dict]) -> int:
+    """Worker processes for planning; 1 means the in-process sequential path."""
+    workers = min(config.execution.num_workers, os.cpu_count() or 1, config.execution.num_simulations)
+    if workers <= 1:
+        return 1
+    try:
+        # Worker processes import the sampler by reference; closures and other
+        # unpicklable samplers (e.g. test doubles) stay in-process.
+        pickle.dumps(sample_scene)
+    except Exception:
+        return 1
+    return workers
+
+
+def _plan_scenes_in_parallel(
+    config: AppConfig, scene_inputs: list[_SceneInputs], failures_path: Path,
+    sample_scene: Callable[..., dict], workers: int, progress: ProgressReporter,
+    merge: Callable[[_SceneInputs, _SceneResult], None],
+) -> None:
+    """Evaluate scenes in worker processes and merge results strictly in scene order."""
+    window = 2 * workers
+    futures: dict[int, Future[_SceneResult]] = {}
+    executor = ProcessPoolExecutor(max_workers=workers)
+    try:
+        submitted = 0
+        for position, item in enumerate(scene_inputs):
+            while submitted < len(scene_inputs) and submitted < position + window:
+                pending = scene_inputs[submitted]
+                futures[submitted] = executor.submit(_evaluate_scene_task, config, pending, failures_path, sample_scene)
+                progress.start(pending.scene_id)
+                submitted += 1
+            merge(item, futures.pop(position).result())
+    except BaseException:
+        # Inspection is read-only: drop queued scenes and leave them pending.
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    executor.shutdown()
+
+
 def inspect_static_plan(
     config: AppConfig, layout: ArtifactLayout | None = None, *,
     sample_scene: Callable[..., dict] | None = None,
@@ -396,94 +550,77 @@ def inspect_static_plan(
     dependencies: dict[str, dict] = deepcopy(previous.get("selected_dependencies", {})) if previous and not regeneration_reason else {}
     expected_paths: set[Path] = set()
     progress.finish()
-    progress.begin("Planificacion", config.execution.num_simulations, "escenas")
+    trusted_previous = previous if previous and not regeneration_reason else None
+    scene_inputs: list[_SceneInputs] = []
     for index in range(config.execution.num_simulations):
         scene_id = f"{config.outputs.naming.scene_id_prefix}_{index + 1:04d}"
         path = layout["scene_manifest_dir"] / f"{scene_id}.json"
         expected_paths.add(path)
-        progress.start(scene_id)
-        outcome: str | None = None
-        try:
-            observe(path)
-            exists = path.exists()
-            if scene_id in failed_records:
-                if exists:
-                    raise ValueError("Failed scene has an unresolved manifest publication")
-                failures.append(deepcopy(failed_records[scene_id]))
-                outcome = "fallidas"
-                continue
-            if not exists and previous and not regeneration_reason and any(
+        # A non-mapping inventory was already reported as a plan conflict above;
+        # treat it as empty so per-scene inputs never crash on it.
+        previous_scenes = previous["scenes"] if previous and isinstance(previous.get("scenes"), dict) else {}
+        scene_inputs.append(_SceneInputs(
+            index=index, scene_id=scene_id, path=path,
+            failed_record=failed_records.get(scene_id) if isinstance(failed_records, dict) else None,
+            # Failures appended during this inspection only concern their own
+            # scene, so the journal loaded above decides this up front.
+            uncommitted_raven_failure=trusted_previous is not None and any(
                 failure.get("scene_id") == scene_id and failure.get("stage") == "raven_t30"
                 for failure in history
-            ):
-                raise ValueError("Uncommitted acoustic sampling failure; cannot renew its budget")
-            if exists:
-                if regeneration_reason or not config.execution.resume_if_possible:
-                    if not config.execution.overwrite_existing:
-                        raise ValueError("Scene exists with resume=false and overwrite=false")
-                    # Explicit regeneration is allowed, but malformed inputs are
-                    # still never silently migrated during a protected resume.
-                    exists = False
-                else:
-                    manifest = _loads(path.read_text(encoding="utf-8"))
-                    validate_static_manifest(manifest, config, index)
-                    recorded = previous.get("scenes", {}).get(scene_id) if previous else None
-                    if recorded is not None:
-                        if recorded.get("functional_hash") != _hash(functional_manifest(manifest)):
-                            raise ValueError("Persisted realization differs from static plan")
-                        if recorded.get("sampling") != manifest["sampling"] or recorded.get("scene_index") != index:
-                            raise ValueError("Invalid static plan scene identity")
-                    else:
-                        replayed = _replay(config, manifest, index, path, noise_plan[index], sample_scene)
-                        if _json(functional_manifest(replayed)) != _json(functional_manifest(manifest)):
-                            if not config.execution.overwrite_existing:
-                                raise ValueError("Legacy realization cannot be replayed under current configuration")
-                            exists = False
-            if not exists:
-                try:
-                    saved = previous.get("scenes", {}).get(scene_id) if previous and config.execution.resume_if_possible and not regeneration_reason else None
-                    if saved:
-                        manifest = _replay(config, {"sampling": saved["sampling"]}, index, path, noise_plan[index], sample_scene)
-                        if saved.get("functional_hash") != _hash(functional_manifest(manifest)):
-                            raise ValueError("Missing scene cannot be replayed from recorded realization")
-                        manifest["reverberation_sampling"].update(deepcopy(saved.get("reverberation_history", {})))
-                    else:
-                        sampled = sample_scene(config, None, index)
-                        sampled["background_noise"] = noise_plan[index]
-                        manifest = build_static_manifest(config, sampled, index, path)
-                except sampler.SceneSamplingFailure as exc:
-                    if path.exists():
-                        raise ValueError("Cannot replace existing scene: authorized regeneration failed sampling") from exc
-                    failure = {**exc.diagnostics, "scene_id": scene_id, "failure_record_path": failures_path.as_posix()}
-                    failures.append(failure)
-                    if failure not in history:
-                        history.append(failure)
-                    outcome = "fallidas"
-                    continue
-                validate_static_manifest(manifest, config, index)
-            manifests.append(PlannedManifest(manifest, path, not exists, index))
-            records[scene_id] = _scene_record(manifest, index)
-            for dependency in _references(manifest):
-                observe(dependency)
-                snapshot = preconditions[dependency]
-                assert snapshot is not None
-                key = dependency.as_posix()
-                old = previous.get("selected_dependencies", {}).get(key) if previous and not regeneration_reason else None
-                if exists and previous and scene_id in previous.get("scenes", {}) and old is None:
-                    raise ValueError(f"Missing selected dependency fingerprint in static plan: {dependency}")
-                if old is not None and (old.get("sha256") != snapshot[2] or old.get("size_bytes") != snapshot[0]):
-                    raise ValueError(f"Selected dependency changed: {dependency}")
-                dependencies[key] = old or {"sha256": snapshot[2], "size_bytes": snapshot[0],
-                    "provenance": "observed_at_adoption" if exists else "observed_at_generation"}
-            outcome = "conservadas" if exists else "nuevas"
-        except (ValueError, OSError, KeyError, TypeError, IndexError) as exc:
-            conflicts.append(f"{path}: {exc}")
-            conflict_causes.append(exc.__cause__ or exc)
-            outcome = "conflictos"
-        finally:
-            # An interruption is not an evaluated scene or a compatibility conflict.
-            if outcome is not None:
-                progress.resolve(scene_id, outcome)
+            ),
+            recorded=previous_scenes.get(scene_id),
+            recorded_present=scene_id in previous_scenes,
+            regeneration_reason=regeneration_reason,
+            noise=noise_plan[index],
+        ))
+
+    def merge(item: _SceneInputs, result: _SceneResult) -> None:
+        outcome = result.outcome
+        if result.observed:
+            preconditions[item.path] = result.snapshot
+        if result.conflict is not None:
+            conflicts.append(result.conflict[0])
+            conflict_causes.append(result.conflict[1])
+        elif result.failure is not None:
+            failures.append(result.failure)
+            if result.new_failure and result.failure not in history:
+                history.append(result.failure)
+        else:
+            manifest = result.manifest
+            assert manifest is not None
+            try:
+                manifests.append(PlannedManifest(manifest, item.path, not result.exists, item.index))
+                records[item.scene_id] = _scene_record(manifest, item.index)
+                for dependency in _references(manifest):
+                    # Shared dependencies are fingerprinted once per inspection;
+                    # revalidate_static_plan re-checks them before publication.
+                    if dependency not in preconditions:
+                        observe(dependency)
+                    snapshot = preconditions[dependency]
+                    assert snapshot is not None
+                    key = dependency.as_posix()
+                    old = trusted_previous.get("selected_dependencies", {}).get(key) if trusted_previous else None
+                    if result.exists and previous and item.recorded_present and old is None:
+                        raise ValueError(f"Missing selected dependency fingerprint in static plan: {dependency}")
+                    if old is not None and (old.get("sha256") != snapshot[2] or old.get("size_bytes") != snapshot[0]):
+                        raise ValueError(f"Selected dependency changed: {dependency}")
+                    dependencies[key] = old or {"sha256": snapshot[2], "size_bytes": snapshot[0],
+                        "provenance": "observed_at_adoption" if result.exists else "observed_at_generation"}
+            except _SCENE_CONFLICTS as exc:
+                conflicts.append(f"{item.path}: {exc}")
+                conflict_causes.append(exc.__cause__ or exc)
+                outcome = "conflictos"
+        progress.resolve(item.scene_id, outcome)
+
+    workers = _planning_workers(config, sample_scene)
+    progress.begin("Planificacion", config.execution.num_simulations, "escenas", parallel=workers > 1)
+    if workers > 1:
+        _plan_scenes_in_parallel(config, scene_inputs, failures_path, sample_scene, workers, progress, merge)
+    else:
+        for item in scene_inputs:
+            progress.start(item.scene_id)
+            # An interruption propagates before resolve: the scene stays pending.
+            merge(item, _evaluate_scene(config, item, failures_path, sample_scene))
     # Stray manifests can indicate a changed scene count/prefix in a legacy run.
     retired = set(previous.get("retired_scene_paths", [])) if previous else set()
     for path in sorted(layout["scene_manifest_dir"].glob("*.json")):

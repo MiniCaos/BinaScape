@@ -460,3 +460,159 @@ def test_options_matrix(tmp_path, resume, overwrite):
     else:
         plan = inspect_static_plan(config, layout)
         assert plan.manifests[0].needs_write is (not resume)
+
+
+# Module-level samplers are picklable, so planning may run them in worker processes.
+def _fail_second_scene(config, rng, index, **kwargs):
+    if index == 1:
+        raise sampler.SceneSamplingFailure({"scene_index": 1, "stage": "sources", "scene_attempts": 50,
+                                           "rejections_by_reason": {"sources": 50}})
+    return sampler.sample_static_scene(config, rng, index, **kwargs)
+
+
+def _interrupt_third_scene(config, rng, index, **kwargs):
+    if index == 2:
+        raise KeyboardInterrupt
+    return sampler.sample_static_scene(config, rng, index, **kwargs)
+
+
+def _spy_process_pool(monkeypatch, cpus=8):
+    from acoustic_orchestrator.pipeline import static_plan
+
+    pools = []
+
+    class SpyPool(static_plan.ProcessPoolExecutor):
+        def __init__(self, *args, **kwargs):
+            pools.append(kwargs.get("max_workers", args[0] if args else None))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(static_plan, "ProcessPoolExecutor", SpyPool)
+    monkeypatch.setattr(static_plan.os, "cpu_count", lambda: cpus)
+    return pools
+
+
+def _publish_with(config, layout, sample_scene):
+    plan = inspect_static_plan(config, layout, sample_scene=sample_scene)
+    with static_writer_lock(layout) as lock:
+        apply_static_plan(plan, lock=lock)
+    return plan
+
+
+def _published_bytes(layout):
+    root = layout["run_root"]
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+def test_parallel_planning_publishes_same_bytes_as_sequential(tmp_path, monkeypatch):
+    import shutil
+
+    pools = _spy_process_pool(monkeypatch)
+    config, layout = fixture_config(tmp_path, count=4)
+    config.execution.num_workers = 1
+    _publish_with(config, layout, _fail_second_scene)
+    sequential = _published_bytes(layout)
+    assert pools == []
+    shutil.rmtree(layout["run_root"])
+
+    config.execution.num_workers = 3
+    plan = _publish_with(config, layout, _fail_second_scene)
+    assert pools == [3]
+    assert [m.scene_index for m in plan.manifests] == [0, 2, 3]
+    assert len(plan.failures) == 1
+    assert _published_bytes(layout) == sequential
+
+    resumed = inspect_static_plan(config, layout, sample_scene=_fail_second_scene)
+    assert pools == [3, 3]
+    assert not any(m.needs_write for m in resumed.manifests)
+    assert not resumed.needs_plan_write
+    assert not resumed.needs_failures_write
+
+
+def test_planning_workers_are_capped_by_scene_count_and_cpus(tmp_path, monkeypatch):
+    pools = _spy_process_pool(monkeypatch, cpus=2)
+    config, layout = fixture_config(tmp_path, count=3)
+    config.execution.num_workers = 8
+    inspect_static_plan(config, layout)
+    assert pools == [2]
+
+    pools.clear()
+    single, single_layout = fixture_config(tmp_path / "single", count=1)
+    single.execution.num_workers = 8
+    inspect_static_plan(single, single_layout)
+    assert pools == []
+
+
+def test_unpicklable_sampler_falls_back_to_sequential_planning(tmp_path, monkeypatch):
+    pools = _spy_process_pool(monkeypatch)
+    config, layout = fixture_config(tmp_path)
+    config.execution.num_workers = 4
+    calls = []
+
+    def closure_sampler(config, rng, index, **kwargs):
+        calls.append(index)
+        return sampler.sample_static_scene(config, rng, index, **kwargs)
+
+    plan = inspect_static_plan(config, layout, sample_scene=closure_sampler)
+    assert pools == []
+    assert calls == [0, 1, 2]
+    assert [m.scene_index for m in plan.manifests] == [0, 1, 2]
+
+
+def test_parallel_interrupt_resolves_only_the_ordered_prefix(tmp_path, monkeypatch):
+    from acoustic_orchestrator.pipeline.progress import ProgressReporter
+
+    pools = _spy_process_pool(monkeypatch)
+    config, layout = fixture_config(tmp_path, count=4)
+    config.execution.num_workers = 2
+    events = []
+    report = ProgressReporter(events.append)
+    with pytest.raises(KeyboardInterrupt):
+        inspect_static_plan(config, layout, sample_scene=_interrupt_third_scene, progress=report)
+    assert pools == [2]
+    resolved = [event.key for event in events if event.kind == "resolved"]
+    assert resolved == ["scene_static_0001", "scene_static_0002"]
+    assert report.counters["conflictos"] == 0
+    assert not any(event.kind == "finish" and event.stage == "Planificacion" for event in events)
+    assert not layout["run_root"].exists()
+
+
+def test_shared_dependencies_are_hashed_once_per_inspection(tmp_path, monkeypatch):
+    from acoustic_orchestrator.pipeline import static_plan
+
+    config, layout = fixture_config(tmp_path)
+    original = static_plan._file_hash
+    hashed = []
+
+    def counting_hash(path):
+        hashed.append(path)
+        return original(path)
+
+    monkeypatch.setattr(static_plan, "_file_hash", counting_hash)
+    plan = inspect_static_plan(config, layout)
+    references = [ref for m in plan.manifests for ref in static_plan._references(m.manifest)]
+    assert len(references) > len(set(references))  # The fixture shares dependencies across scenes.
+    assert len(hashed) == len(set(hashed))
+
+
+@pytest.mark.parametrize("field,resume,overwrite", [("scenes", False, False), ("scenes", False, True)])
+def test_corrupt_plan_inventory_is_reported_as_conflict(tmp_path, field, resume, overwrite):
+    config, layout = fixture_config(tmp_path)
+    plan = publish(config, layout)
+    data = json.loads(plan.plan_path.read_text(encoding="utf-8"))
+    data[field] = []
+    plan.plan_path.write_text(json.dumps(data), encoding="utf-8")
+    config.execution.resume_if_possible = resume
+    config.execution.overwrite_existing = overwrite
+    with pytest.raises(StaticPlanConflict, match="Invalid static plan inventories"):
+        inspect_static_plan(config, layout)
+
+
+def test_non_mapping_failed_scenes_is_tolerated_as_before(tmp_path):
+    config, layout = fixture_config(tmp_path)
+    plan = publish(config, layout)
+    data = json.loads(plan.plan_path.read_text(encoding="utf-8"))
+    data["failed_scenes"] = []
+    plan.plan_path.write_text(json.dumps(data), encoding="utf-8")
+    resumed = inspect_static_plan(config, layout)
+    assert [m.scene_index for m in resumed.manifests] == [0, 1, 2]
+    assert not resumed.failures

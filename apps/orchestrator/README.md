@@ -253,6 +253,12 @@ MATLAB subprocesses after runtime inputs are prepared. Do not configure more
 workers than available MATLAB/RAVEN licenses, and return to `1` if the local
 RAVEN setup shows hidden global state.
 
+The same setting also parallelizes static scene planning: scenes are sampled and
+inspected in up to `min(num_workers, CPU count, num_simulations)` worker
+processes and merged in scene order, so manifests, the static plan and the
+sampling failure journal are identical to the sequential run. Custom samplers
+that cannot be pickled (for example closures) are planned in-process.
+
 The canonical single-output example enables `binaural_hrtf`. MATLAB requires
 `render.sample_rate_hz: 44100`. Before completing the remaining variants,
 the pipeline checks that the canonical RAVEN T30 has exactly ten finite,

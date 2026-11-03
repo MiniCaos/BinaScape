@@ -91,7 +91,7 @@ cropped_audio/    # solo cuando se prepara audio recortado
 
 Los nombres WAV y JSON se obtienen de `outputs.naming.wav_pattern` y `metadata_pattern`; solamente `{scene_id}` y `{output_type}` son placeholders admitidos. Las claves antiguas de directorios independientes no son aceptadas por el loader. Los directorios se crean cuando una etapa escribe archivos.
 
-Los índices JSONL registran planificación, resultados, validación e intentos de reanudación; la existencia de un WAV aislado no basta para dar una variante por completada. Las opciones `overwrite_existing` y `resume_if_possible` gobiernan estos comportamientos. `execution.num_workers` controla el paralelismo MATLAB; requiere licencias y un entorno local que tolere procesos concurrentes.
+Los índices JSONL registran planificación, resultados, validación e intentos de reanudación; la existencia de un WAV aislado no basta para dar una variante por completada. Las opciones `overwrite_existing` y `resume_if_possible` gobiernan estos comportamientos. `execution.num_workers` controla el paralelismo MATLAB; requiere licencias y un entorno local que tolere procesos concurrentes. También paraleliza la planificación estática en procesos (`ProcessPoolExecutor`), fusionando los resultados en orden de escena para que el plan sea idéntico al secuencial.
 
 ## Handoff Clarity opcional
 
