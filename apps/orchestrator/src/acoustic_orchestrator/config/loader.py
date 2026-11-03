@@ -1,4 +1,5 @@
 from pathlib import Path
+from string import Formatter
 
 import yaml
 
@@ -23,7 +24,33 @@ def load_config(config_path: str | Path) -> AppConfig:
     _normalize_legacy_config(raw_config)
 
     config = AppConfig.model_validate(raw_config)
+    _resolve_seed_placeholders(config)
     return resolve_relative_paths(config, config_path.parent)
+
+
+def _resolve_seed_placeholders(config: AppConfig) -> None:
+    seed = config.experiment.random_seed
+    config.experiment.experiment_id = _format_seed(
+        config.experiment.experiment_id, seed, "experiment.experiment_id"
+    )
+    if config.outputs.run_name is not None:
+        config.outputs.run_name = _format_seed(config.outputs.run_name, seed, "outputs.run_name")
+
+
+def _format_seed(template: str, seed: int, field: str) -> str:
+    """Replace the only supported placeholder, ``{seed}``, with the experiment seed."""
+    try:
+        parts = list(Formatter().parse(template))
+    except ValueError as exc:
+        raise ValueError(f"{field} has malformed braces: {template!r}") from exc
+    for _, name, spec, conversion in parts:
+        if name is None:
+            continue
+        if name != "seed" or spec or conversion:
+            raise ValueError(
+                f"{field} only supports the '{{seed}}' placeholder, got {template!r}"
+            )
+    return template.format(seed=seed)
 
 
 def resolve_relative_paths(config: AppConfig, base_dir: Path) -> AppConfig:

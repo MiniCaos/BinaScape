@@ -135,6 +135,13 @@ The loader rejects legacy independent output-root keys and
 `room_sampling.max_rt30_s`; use `outputs.artifact_root`, `outputs.run_name`,
 and `room_sampling.reverberation`.
 
+`experiment.experiment_id` and `outputs.run_name` accept a `{seed}` placeholder
+that the loader replaces with `experiment.random_seed` (for example,
+`experiment_id: e2e_1_worker_s{seed}` with `random_seed: 42` becomes
+`e2e_1_worker_s42`). It is the only supported placeholder; any other field,
+format spec, or unbalanced brace is rejected when the config loads. Use `{{` and
+`}}` for literal braces.
+
 Current material contract in generated manifests:
 
 - `room.materials` is preserved as a surface-to-`material_id` map.
