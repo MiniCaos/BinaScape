@@ -439,6 +439,8 @@ Test files are under `apps/orchestrator/tests/`. "§x.y" refers to sections of t
 | Metadata from a different backend | `test_pra_worker.py::test_backend_identity_mismatch_rejected`; `test_pra_pipeline.py::test_raven_variant_with_pra_method_or_identity_rejected` |
 | Switching an existing run to Pyroomacoustics | `test_pra_pipeline.py::test_raven_run_resumed_as_pyroomacoustics_reuses_nothing_and_changes_nothing` |
 | Changed ISM order | `test_pra_pipeline.py::test_changed_ism_order_is_not_equivalent_input` |
+| No simplified replacement | `test_render_backend_config.py::test_head_related_outputs_rejected`, `test_directional_source_rejected`, `test_hearing_degradation_rejected`, `test_dynamic_scene_rejected` (§2.3: explicit rejection, no worker launched) |
+| Dynamic scene requested with Pyroomacoustics | `test_render_backend_config.py::test_dynamic_scene_rejected` |
 
 ### pyroomacoustics-render-backend
 
@@ -482,14 +484,23 @@ Test files are under `apps/orchestrator/tests/`. "§x.y" refers to sections of t
 | Repeat render | `test_pra_worker.py::test_two_worker_processes_are_byte_identical` |
 | RAVEN-only installation | §2.6 (suite without the extra: 1062 passed, package not installed); `test_pra_worker.py::test_raven_only_code_paths_never_import_pyroomacoustics`; `test_render_backend_config.py::test_raven_validation_never_queries_pyroomacoustics` |
 | Characterized yaw behavior | `test_pra_acoustics.py::test_legacy_angular_convention_characterized` |
+| Existing process configuration and evidence contracts | §6.1–6.7, §8.1–8.5: shared runner/attempt readers, unchanged retry keys and diagnostics layout; `test_pra_pipeline.py`, `test_pra_resilience.py` |
+| Worker invocation evidence | `test_pra_resilience.py::test_worker_attempt_diagnostics_exist`; §6.2 and §8.5 record command, identity, timing, exit code and console evidence |
+| Effective simulation parameters recorded | `test_pra_simulation.py::test_parameters_applied`; `test_pra_worker.py::test_builder_sidecar_and_wav_pass_canonical_validation`; §3.4–3.5, §5.2 |
+| Synthesis stage ordering | §4.2–4.4: source preparation, full convolution/tail trim, offset and duration handling, first guard, noise and second guard; existing `test_pra_synthesis.py` stage tests and `test_pra_e2e.py` |
+| Reverb-tail trimming | `test_pra_synthesis.py::test_full_convolution_lengths_and_tail_trim`; §4.3 |
+| Noise raises the output peak | `test_pra_synthesis.py::test_second_guard_recorded`; §4.4 |
+| Existing sidecar field inventory | `test_pra_worker.py::test_builder_sidecar_and_wav_pass_canonical_validation`; §5.2 lists the existing identity, seed, receiver, summary and output fields |
+| Backend T30 descriptor | `test_pra_synthesis.py::test_descriptor_passes_backend_aware_gate_only_for_its_backend`; `test_pra_pipeline.py::test_pra_descriptor_accepted_and_cross_backend_method_rejected`; §4.6, §6.5 |
+| Direct-path distance attenuation | `test_pra_acoustics.py::test_inverse_square_energy_ratio`; §7.2 records energy ratio 3.932 (limit 4 ±5%) |
 
 ### circular-microphone-array (modified)
 
 | Scenario | Evidence |
 |---|---|
-| Eight-channel output | Pyroomacoustics: `test_pra_worker.py::test_eight_channel_worker_output_with_gain_offset_duration`; RAVEN: existing tests (validator path unchanged) + 10.4 **BLOCKED** for a real RAVEN render |
+| Eight-channel output | Pyroomacoustics: `test_pra_worker.py::test_eight_channel_worker_output_with_gain_offset_duration`; RAVEN: existing tests + successful real Windows/RAVEN E2E (§10.4 resumed 2026-11-05) |
 | Unequal source distances | `test_pra_acoustics.py` 7.2 (level), 7.3/7.4 (arrival) — no per-channel normalization/alignment in `synthesis.render_source` |
-| Same contract with either backend | `test_pra_pipeline.py` renders the same array config through both runners and validates both with the same `validate_render` contract; real RAVEN execution **BLOCKED** (10.4) |
+| Same contract with either backend | `test_pra_pipeline.py` renders the same array config through both runners and validates both with the same `validate_render` contract; real Windows/RAVEN E2E passed (§10.4 resumed 2026-11-05) |
 
 ### static-render-acceptance (modified)
 
@@ -669,3 +680,151 @@ non-shoebox shape cannot silently inherit an unaffordable order 100; the example
   created (2026-11-03T22:00:41-03:00). Nothing staged; HEAD = `develop` = `eb7cb92`.
 - Task 10.4 remains **BLOCKED** and unchecked (Windows MATLAB/RAVEN regression pending the
   maintainer).
+
+## 10.4 Windows/RAVEN — resumed 2026-11-05
+
+This section records a new Windows session; it does not replace the historical Linux evidence.
+
+- Checkout: `pr-32`, HEAD `63168173e1a10ae07cc03c8d13063a8cde975096`.
+  Starting `git status --short`: only `?? .atl/` (pre-existing, left untouched).
+- Existing `.venv/Scripts/python.exe`: CPython 3.12.12; imports the orchestrator from this
+  checkout. No dependencies installed or lockfile changes made.
+- `validate_config(load_config(...))` succeeds for both
+  `configs/experiments/circular_array_only.yml` and `circular_array_mixed.yml`.
+- MATLAB: R2025b Update 2 (`25.2.0.3055257`); `which('itaAudio')` and
+  `which('itaRavenProject')` resolve under `D:/Tesis/toolbox-master/toolbox-master/`.
+- Initial invocation from the repository root:
+  `matlab -batch "results = runtests('apps/matlab/tests'); ...; assertSuccess(results);"`
+  (also printed version, dependency paths, result table and counts) → exit 1,
+  **18 passed, 112 failed, 106 incomplete, 130 total**. The application paths were not added;
+  the log reports `MATLAB:UndefinedFunction` for helpers such as `generate_colored_noise`,
+  `fit_noise_to_audio_shape` and `scale_noise_to_snr`. This is not a valid regression verdict.
+  Full log: `C:/Users/sguaj/AppData/Local/Temp/opencode/pyroom-task10-4-matlab-20261105.log`.
+  A rerun adds `addpath(genpath('apps/matlab'))`, matching production runner setup.
+- Corrected invocation:
+  `matlab -batch "addpath(genpath('apps/matlab')); results = runtests('apps/matlab/tests');
+  disp(table(results)); fprintf('COUNTS passed=%d failed=%d incomplete=%d total=%d\n',
+  sum([results.Passed]), sum([results.Failed]), sum([results.Incomplete]), numel(results));
+  assertSuccess(results);"` → **exit 0; 130 passed, 0 failed, 0 incomplete**.
+  Full log: `C:/Users/sguaj/AppData/Local/Temp/opencode/pyroom-task10-4-matlab-path-20261105.log`.
+  Expected fault-injection diagnostics and built-in-shadowing warnings occurred without failing tests.
+- `openspec validate add-pyroomacoustics-render-backend --strict` → **exit 1**, with
+  **16 warnings** about ADDED requirement text exceeding 500 characters (13 in
+  `pyroomacoustics-render-backend`, 3 in `render-backend-selection`). This differs from the
+  historical successful validation above; requirements were not edited as part of task 10.4.
+- Acceptance harness launched with the existing interpreter:
+  `.venv/Scripts/python.exe apps/orchestrator/tests/verify_render_acceptance.py --output-root
+  C:/Users/sguaj/AppData/Local/Temp/opencode/pyroom-task10-4-acceptance-20261105`.
+  → **exit 0; both phases passed** against the installed RAVEN backend:
+  - Normal: attempt `b26efcd2c8174300b62a2aa5318c0ffa`, `process_status: succeeded`,
+    MATLAB exit 0, `render_validity: valid`, `decision: continue`.
+  - Harness-only post-completion error: attempt `883066e6b2b44a1eb59e2e0f140fab2b`,
+    `process_status: failed`, MATLAB exit 1, `render_validity: valid`,
+    `decision: continue_with_warning`. The harness verified the completion inventory,
+    acoustic acceptance, committed outcome and diagnostic failure location.
+  Evidence: `C:/Users/sguaj/AppData/Local/Temp/opencode/pyroom-task10-4-acceptance-20261105/acceptance.json`.
+- Circular-array E2E launched after acceptance completed:
+  `.venv/Scripts/python.exe apps/orchestrator/tests/verify_circular_array_e2e.py render
+  --output-root C:/Users/sguaj/AppData/Local/Temp/opencode/pyroom-task10-4-circular-20261105`.
+  → **exit 1; partial pass, harness assertion failure**:
+  - `PASS array_only: 1 rendered and resumed variants` (the harness checked the 8-channel,
+    44100 Hz, 88200-frame WAV, metadata, T30 and resume).
+  - Mixed case rendered **40/40 variants** across **10 scenes**, with 0 failed variants,
+    0 failed MATLAB processes, 0 retries, and 40 MATLAB invocations. The harness then failed
+    at line 112 because it expects exactly 4 completed variants for one scene.
+    `configs/experiments/circular_array_mixed.yml` sets `execution.num_simulations: 10`,
+    and `verify_render` does not override it. Mixed-case `_verify_outputs` and resume checks
+    were therefore **not reached**; successful render counts alone do not certify them.
+  - No `render_verification.json` was published (written only after both cases pass).
+    Artifacts remain under the fresh output root above; mixed index:
+    `mixed/metadata/indexes/render_index.jsonl`.
+- **PAUSED:** task 10.4 remains unchecked (53/54 complete). MATLAB and acceptance smoke pass,
+  but circular mixed-case acceptance does not. Operator guidance is required before adjusting
+  the harness to its intended one-scene case and rerunning in a new output directory.
+- Operator authorized the harness correction and fresh rerun. Added
+  `config.execution.num_simulations = 1` in `verify_circular_array_e2e.py::verify_render`,
+  so both cases match their existing one-scene assertions independently of example batch size.
+  No acceptance assertion or example configuration changed.
+- Authorized rerun:
+  `.venv/Scripts/python.exe apps/orchestrator/tests/verify_circular_array_e2e.py render
+  --output-root C:/Users/sguaj/AppData/Local/Temp/opencode/pyroom-task10-4-circular-single-scene-20261105`.
+  → **exit 1**: array-only rendered and resumed successfully; mixed case reached
+  `_verify_outputs` but failed its fixed 88200-frame assertion at line 48.
+  The mixed example requests `source_sampling.timing.total_duration_s: 5.0` and
+  `receiver_outputs.circular_array.num_microphones: 3`, while this harness expects
+  2 seconds and 8 microphones. All four mixed output WAV headers report 44100 Hz and
+  220500 frames; HRTF/HARTF outputs have 2 channels and the circular array has 3.
+  These header observations are diagnostic evidence only, not a pass of the remaining
+  acceptance checks. Mixed metadata checks and resume were not completed; the report
+  was not published. Task 10.4 remains unchecked, pending operator authorization to
+  explicitly set the harness's intended 2-second, 8-microphone case and rerun.
+- Operator authorized both additional harness settings. `verify_render` now explicitly sets
+  `source_sampling.timing.total_duration_s = 2.0` and
+  `receiver_outputs.circular_array.num_microphones = 8`, alongside the authorized one-scene
+  setting. Example configs and all acceptance assertions remain unchanged.
+- Fresh rerun:
+  `.venv/Scripts/python.exe apps/orchestrator/tests/verify_circular_array_e2e.py render
+  --output-root C:/Users/sguaj/AppData/Local/Temp/opencode/pyroom-task10-4-circular-8mic-2s-20261105`.
+  → **exit 0; PASS array_only (1 rendered and resumed variant), PASS mixed (4 rendered
+  and resumed variants)**. Both cases passed all unchanged `_verify_outputs` assertions:
+  8-channel array / 2-channel HRTF/HARTF, 44100 Hz, 88200 frames, metadata/source poses,
+  ten finite positive T30 bands, microphone mapping, receiver IR selection and serialized
+  RAVEN HRTF project selection. Resume reused every variant without launching MATLAB.
+  Report: `C:/Users/sguaj/AppData/Local/Temp/opencode/pyroom-task10-4-circular-8mic-2s-20261105/render_verification.json`.
+- **Final task 10.4 result: PASS.** MATLAB suite: 130/130; acceptance smoke: both phases;
+  circular E2E: both cases including resume. Historical BLOCKED/PAUSED entries above describe
+  earlier sessions/attempts and are superseded by this result. Clarity processing was not
+  rerun in this Windows task (Linux evidence remains in §10.3).
+- Session changes: the three authorized harness settings, this evidence file and the 10.4
+  checkbox. No production code, example config, dependency or lockfile changes; `.atl/`
+  left untouched. Strict OpenSpec validation still has the 16 warnings recorded above;
+  completing tracked implementation tasks does not resolve that separate validation issue.
+
+## Editorial revision A3 — focused ADDED requirements (operator-confirmed, 2026-11-05)
+
+- Scope: only this evidence file and the existing `specs/pyroomacoustics-render-backend/spec.md`
+  and `specs/render-backend-selection/spec.md`. The previously authorized harness edits and
+  completed 10.4 checkbox remain unchanged. No implementation, dependency, example, proposal,
+  design or MODIFIED requirement changed during this editorial revision.
+- Split the 16 overlong ADDED descriptions into focused contracts, retaining original
+  requirement headers and moving their other obligations into new ADDED blocks with scenarios.
+  Normative physics, record formats, field inventories, ordering, formulae, tolerances, error
+  handling, exclusions and compatibility remain in the specs, not relegated to design prose.
+  The transform's origin rationale already exists in design D6; no design amendment is needed.
+- Obligation-preservation review:
+
+| Original requirement group | Obligations retained across the focused blocks |
+|---|---|
+| Isolated worker process | Out-of-process dispatch, exact output paths, immutable snapshot/context, publication-before-zero-exit, non-zero unhandled errors |
+| Existing MATLAB-process obligations | Inherited record formats/names, invalid-input report, retry budget/circuit/chains/isolation/reconcile, events/progress, invocation diagnostics |
+| Coordinate transform | Forward/inverse formulae, proper rigid rotation, per-room translation, distance/time preservation, recorded transform, unchanged public/legacy frames |
+| Geometry and surfaces | Manifest geometry, shoebox/extrusion, unknown-type rejection, winding/area, physical wall identity, floor/ceiling surfaces |
+| Material conversion | Ten center-frequency octave values from 31 bands, same scattering conversion, invalid-value rejection, per-surface provenance, no equivalence claim |
+| ISM simulation | Geometry-specific orders, atmospheric/default physics, air absorption, disabled ray tracing/randomized ISM, effective parameter provenance |
+| Circular receiver | Snapshot positions/order, one RIR per pair, channel mapping, no recomputed geometry or individual alignment/normalization/beamforming |
+| Signal synthesis | Ordered preparation, downmix/provenance, normalization then gain, full convolution/tail trim, rounded offset, sum length, target trim/pad, first guard |
+| Noise | Layer seeds and spectral shaping, loop/trim/channel fitting, pooled pre-noise SNR and silent skips, second guard/metadata, no backend noise facilities or MATLAB byte-parity claim |
+| Sidecar | Existing field inventory/semantics, copied schema version, backend identity and all provenance fields |
+| T30 | Octave filtering/Schroeder/fit, pair invalidation, mean aggregation, null bands, unchanged descriptor and derived-field semantics |
+| Propagation | Recorded global delay/speed, direct arrival tolerance, relative delay tolerance and inverse-square energy ratio |
+| Angular convention | Existing positions, opposite ring/yaw risk, characterization only, separately authorized correction |
+| Backend configuration | Conditional RAVEN file, exclusive blocks, explicit RAVEN tuning rejection, ISM orders/default, boolean air absorption, paired finite atmosphere/humidity range |
+| Unsupported features | Named pre-planning rejection without substitutes, all head-related outputs, source directivity, degradation/dynamic scenes, rate and package restrictions |
+| RAVEN identity | Unchanged normalized config, byte-identical manifests, no new metadata requirement, explicit generator-contract conflict without silent reuse/overwrite |
+
+- Checked proposal/design/tasks and both unedited MODIFIED deltas against the revision: no
+  scope or implementation delta; original requirement headers remain available to references.
+- Structural audit against `git show HEAD:<spec-path>`: all **60 original scenarios** in these
+  two files preserved with identical names and WHEN/THEN text; **11 additional scenarios** map
+  to existing tests or recorded evidence in §10.5 above. No scenario removed or weakened.
+  Every requirement has a scenario. Description lengths: Pyroomacoustics **39 requirements,
+  maximum 424 characters**; backend selection **17 requirements, maximum 458 characters**.
+- `openspec validate add-pyroomacoustics-render-backend --strict` → **exit 0**,
+  `Change 'add-pyroomacoustics-render-backend' is valid`, **no warnings**. This supersedes the
+  earlier 16-warning result without erasing its historical record.
+- Runtime tests were not rerun for this editorial-only revision; their prior results remain
+  evidence for unchanged behavior, not new executions. Tracking remains **54/54 complete**.
+- Final mapping audit: **90/90 scenarios mapped** across the four deltas (3 circular-array,
+  47 Pyroomacoustics, 24 backend-selection, 16 static-acceptance); no unmapped scenarios.
+  Both MODIFIED delta files match HEAD exactly. `git diff --check` reports no whitespace
+  errors (only Git's local LF-to-CRLF notices); `openspec list --json` confirms 54/54 complete.

@@ -1,8 +1,10 @@
+# render-backend-selection Specification
+
 ## Purpose
 
 Select the acoustic render backend for static experiments, validate backend-specific configuration before any scene is planned or rendered, and keep backend identity explicit in manifests, metadata and resume decisions so RAVEN and Pyroomacoustics outputs are never confused.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Explicit render backend selector with RAVEN default
 The experiment configuration SHALL accept `render.backend` with the values `raven` and `pyroomacoustics`. When `render.backend` is absent, the effective backend SHALL be `raven`. Any other value SHALL be rejected by configuration validation with an error naming `render.backend` and the supported values.
@@ -20,14 +22,7 @@ The experiment configuration SHALL accept `render.backend` with the values `rave
 - **THEN** validation fails before planning with an error naming `render.backend` and listing `raven` and `pyroomacoustics`
 
 ### Requirement: Backend-specific configuration blocks
-The `raven` block SHALL be required, and its `base_rpf_file` SHALL be required to exist, only when the effective backend is `raven`. When the effective backend is `pyroomacoustics`:
-- A top-level `pyroomacoustics` block SHALL be required. It SHALL contain an integer `max_order` ≥ 0 and a boolean `air_absorption`, and SHALL accept:
-  - an optional integer `max_order_non_shoebox` ≥ 0, which defaults to `max_order`;
-  - optional finite `temperature_c` and `humidity_pct`, which SHALL be provided together and with `humidity_pct` in [0, 100].
-- The `raven` block, when present, SHALL be rejected.
-- A RAVEN-only `render` tuning field explicitly set in the configuration SHALL be rejected. These fields are `generate_rir`, `generate_brir`, `simulation_type_rt`, `simulation_type_is`, `num_particles` and `is_order_ps`.
-
-When the effective backend is `raven`, a `pyroomacoustics` block SHALL be rejected.
+The `raven` block and existence of its `base_rpf_file` SHALL be required only for the `raven` backend. For `pyroomacoustics`, a top-level `pyroomacoustics` block SHALL be required and a `raven` block SHALL be rejected. For `raven`, a `pyroomacoustics` block SHALL be rejected.
 
 #### Scenario: Linux configuration without RAVEN
 - **WHEN** `render.backend` is `pyroomacoustics` and the configuration has no `raven` block
@@ -37,44 +32,68 @@ When the effective backend is `raven`, a `pyroomacoustics` block SHALL be reject
 - **WHEN** `render.backend` is `pyroomacoustics` and a `raven.base_rpf_file` is also configured
 - **THEN** validation fails, naming `raven` as not applicable to the selected backend
 
+### Requirement: RAVEN-only tuning rejection
+Under `pyroomacoustics`, explicitly configured RAVEN-only `render` fields SHALL be rejected: `generate_rir`, `generate_brir`, `simulation_type_rt`, `simulation_type_is`, `num_particles` and `is_order_ps`.
+
 #### Scenario: RAVEN tuning under Pyroomacoustics
 - **WHEN** `render.backend` is `pyroomacoustics` and `render.num_particles: 60000` is explicitly configured
 - **THEN** validation fails, naming `render.num_particles` as a RAVEN-only field, instead of ignoring it
 
+### Requirement: Required ISM parameters and non-shoebox order
+The `pyroomacoustics` block SHALL require an integer `max_order` ≥ 0 and boolean `air_absorption`. It SHALL accept an optional integer `max_order_non_shoebox` ≥ 0, defaulting to `max_order`.
+
 #### Scenario: Missing ISM order
 - **WHEN** `render.backend` is `pyroomacoustics` and `pyroomacoustics.max_order` is absent, negative or not an integer
 - **THEN** validation fails, naming `pyroomacoustics.max_order`
+
+### Requirement: Paired atmospheric conditions
+Optional `pyroomacoustics.temperature_c` and `humidity_pct` SHALL be finite and provided together, with humidity in [0, 100].
 
 #### Scenario: Partial atmospheric conditions
 - **WHEN** `pyroomacoustics.temperature_c` is set without `pyroomacoustics.humidity_pct`
 - **THEN** validation fails instead of combining a configured value with a hidden default
 
 ### Requirement: Explicit rejection of unsupported backend features
-Configuration validation SHALL reject, before planning, every requested capability that the selected backend does not support, with an error that names the configuration field and the selected backend. For `pyroomacoustics` the rejected capabilities SHALL be:
-- an enabled `binaural_hrtf`, `bte_rear_hartf` or `bte_front_hartf` receiver output;
-- any source type with `directivity`;
-- `hearing_degradation.enabled: true`;
-- `scene_type: dynamic`;
-- `render.sample_rate_hz` other than 44100;
-- an installed Pyroomacoustics package that is missing or outside the supported version range.
+Configuration validation SHALL reject every unsupported requested capability before planning, naming its configuration field and selected backend. The backend SHALL NOT substitute omnidirectional sources, omnidirectional receivers or other simplified models for unsupported requests.
 
-The backend SHALL NOT substitute an omnidirectional source, an omnidirectional receiver or any other simplified model for a requested unsupported capability.
+#### Scenario: No simplified replacement
+- **WHEN** a configuration requests an unsupported capability
+- **THEN** validation fails before planning instead of rendering a simplified replacement, with an error naming the field and backend
+
+### Requirement: Unsupported receiver outputs
+For `pyroomacoustics`, enabled `binaural_hrtf`, `bte_rear_hartf` or `bte_front_hartf` receiver outputs SHALL be rejected.
 
 #### Scenario: Binaural output requested with Pyroomacoustics
 - **WHEN** `render.backend` is `pyroomacoustics` and `receiver_outputs.binaural_hrtf.enabled` is true
 - **THEN** validation fails, naming `receiver_outputs.binaural_hrtf` as unsupported by `pyroomacoustics`
 
+### Requirement: Unsupported source directivity
+For `pyroomacoustics`, any source type with `directivity` SHALL be rejected.
+
 #### Scenario: Directional source requested with Pyroomacoustics
 - **WHEN** a source type configures a `.daff` `directivity` and the backend is `pyroomacoustics`
 - **THEN** validation fails, naming that source type's `directivity` field, and no scene is rendered with an omnidirectional replacement
+
+### Requirement: Unsupported hearing degradation and dynamic scenes
+For `pyroomacoustics`, `hearing_degradation.enabled: true` and `scene_type: dynamic` SHALL be rejected before planning. Existing Clarity eligibility rules SHALL remain unchanged.
 
 #### Scenario: Hearing degradation requested with Pyroomacoustics
 - **WHEN** `hearing_degradation.enabled` is true and the backend is `pyroomacoustics`
 - **THEN** validation fails before planning, and the existing Clarity eligibility rules remain unchanged
 
+#### Scenario: Dynamic scene requested with Pyroomacoustics
+- **WHEN** the backend is `pyroomacoustics` and `scene_type` is `dynamic`
+- **THEN** validation fails before planning, naming the scene-type field and backend
+
+### Requirement: Unsupported Pyroomacoustics sample rates
+For `pyroomacoustics`, `render.sample_rate_hz` other than 44100 SHALL be rejected before planning, naming the field and supported rates.
+
 #### Scenario: Unsupported sample rate
 - **WHEN** the backend is `pyroomacoustics` and `render.sample_rate_hz` is 48000
 - **THEN** validation fails, naming `render.sample_rate_hz` and the rates supported by `pyroomacoustics`
+
+### Requirement: Backend dependency availability
+For `pyroomacoustics`, a missing package or a version outside the supported range SHALL be rejected before planning or worker launch, naming the required dependency and version range.
 
 #### Scenario: Backend package unavailable
 - **WHEN** the backend is `pyroomacoustics` and the package cannot be imported, or its version is outside the supported range
@@ -92,20 +111,21 @@ Each backend SHALL declare its set of supported render sample rates. Configurati
 - **THEN** render validation records `runtime_sample_rate_invalid` and the render is not accepted
 
 ### Requirement: Stable identity of existing RAVEN configurations and manifests
-For a configuration whose effective backend is `raven`:
-- the normalized configuration used for static plan identity SHALL be identical to the one produced before this change;
-- scene and runtime manifests SHALL be byte-identical in content to those produced before this change, and SHALL NOT contain `render.backend` or Pyroomacoustics parameters;
-- RAVEN render metadata SHALL NOT be required to contain any new field.
-
-A change to the static generator contract caused by modifying hashed source files SHALL keep producing the existing explicit plan-conflict behavior, and SHALL NOT cause silent reuse or overwrite.
+For the effective `raven` backend, the normalized configuration used for static plan identity SHALL be identical to the one produced before this change.
 
 #### Scenario: Normalized configuration of a RAVEN experiment
 - **WHEN** the normalized static configuration is computed for `configs/experiments/circular_array_only.yml` with and without an explicit `render.backend: raven`
 - **THEN** both results are equal to the normalized configuration produced before this change for the same file
 
+### Requirement: Unchanged RAVEN manifests and metadata requirements
+For `raven`, scene and runtime manifests SHALL be byte-identical in content to those produced before this change, without `render.backend` or Pyroomacoustics parameters. RAVEN metadata SHALL NOT require any new field.
+
 #### Scenario: RAVEN runtime manifest content
 - **WHEN** a RAVEN runtime manifest is generated for a scene
 - **THEN** it contains no `render.backend` key and no Pyroomacoustics parameters
+
+### Requirement: Explicit conflicts after generator-contract changes
+Changes to the static generator contract caused by modifying hashed source files SHALL retain existing explicit plan-conflict behavior, without silent reuse or overwrite.
 
 #### Scenario: Run created before the upgrade
 - **WHEN** a RAVEN run directory planned before this change is resumed after a generator-contract change
