@@ -828,3 +828,47 @@ This section records a new Windows session; it does not replace the historical L
   47 Pyroomacoustics, 24 backend-selection, 16 static-acceptance); no unmapped scenarios.
   Both MODIFIED delta files match HEAD exactly. `git diff --check` reports no whitespace
   errors (only Git's local LF-to-CRLF notices); `openspec list --json` confirms 54/54 complete.
+
+## Final Linux regression and sign-off (2026-11-05)
+
+This section adds a final Linux run on the archived change; earlier entries are kept as historical
+evidence and are not rewritten.
+
+- Tested commit: `525ef981aaed27839d9b5548ac0d314e603c71b5` (branch
+  `feat/add-pyroomacoustics-render-backend`, parent `63168173e1a10ae07cc03c8d13063a8cde975096`).
+- Environment: WSL2 Linux 6.6.87.1 (x86_64), CPython 3.12.12, uv 0.9.5, OpenSpec CLI 1.13.0,
+  existing repo-local `.venv` (no dependency installed or upgraded; `uv.lock` unchanged):
+  pyroomacoustics 0.10.1, numpy 2.4.6, scipy 1.17.1, soundfile 0.13.1, cython 3.3.1,
+  pydantic 2.13.4, pytest 9.0.3.
+- `BINASCAPE_REQUIRE_PYROOMACOUSTICS=1 OMP_NUM_THREADS=1 uv run --package acoustic-orchestrator
+  --extra dev --extra pyroomacoustics pytest apps/orchestrator/tests -p no:cacheprovider -q -rs`
+  → **1194 passed, 0 failed, 0 skipped** (154.7 s).
+- `uv run --package output-analyzer pytest apps/output-analyzer/tests -p no:cacheprovider -q`
+  → **89 passed**.
+- No application code changed after the maintainer's Windows validation:
+  `git diff 6316817..525ef98` touches only `apps/orchestrator/tests/verify_circular_array_e2e.py`
+  (the three authorized harness settings, not collected by pytest) and OpenSpec documents; no change
+  under `apps/orchestrator/src`, `apps/matlab`, `apps/clarity-backend`, `apps/output-analyzer`,
+  `configs`, `apps/orchestrator/pyproject.toml` or `uv.lock`. The Windows evidence for tested HEAD
+  `6316817` therefore applies to the code at `525ef98`.
+- Task 10.4 was completed by the maintainer (section "10.4 Windows/RAVEN — resumed 2026-11-05":
+  MATLAB 130/130, acceptance smoke both phases, circular E2E both cases with resume). It supersedes
+  the earlier BLOCKED and PAUSED records in this file, which remain as history. Operator approval
+  of the PASS conclusion: 2026-11-05. The raw Windows logs referenced there are on the maintainer's
+  machine and are not part of the repository; they were not re-examined here.
+- Amendment A3 (operator-approved): requirement prose of the two ADDED deltas compared with the
+  pre-A3 text at `6316817`. All 60 original scenarios are retained with identical WHEN/THEN text;
+  every prohibition is retained (several reworded, e.g. "never inside the orchestrator's process",
+  "without silent reuse or overwrite"); no numeric tolerance or formula was lost. The only
+  reduction in explicitness: the sidecar requirement now names the existing fields by category
+  ("identity and output fields, seed provenance, …") instead of listing them, anchored to "every
+  field required by existing array render validation"; the validator and the unchanged scenario
+  still enforce the full inventory. No contradiction found. The synchronized baseline
+  `openspec/specs/{pyroomacoustics-render-backend,render-backend-selection}` requirements are
+  identical to the archived deltas; A1 (rotation + per-room translation) and A2 (no CI/CD
+  automation) remain in effect.
+- `openspec validate --all --strict` → 10 passed, 0 failed.
+- Known acoustic limitations recorded in §7.7 and §9.4 still apply unchanged (ISM non-convergence
+  for long, non-diffuse rooms; extruded rooms rejected by the T30 gate at affordable orders;
+  31.5/63 Hz absorption without independent effect; analyzer T30 labelling; legacy array angular
+  convention).
